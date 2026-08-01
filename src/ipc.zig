@@ -1,7 +1,7 @@
 const std = @import("std");
-const posix = std.posix;
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const lib_posix = @import("posix.zig");
 
 pub const Tag = enum(u8) {
     Input = 0,
@@ -94,7 +94,7 @@ pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
 }
 
 pub fn appendMessage(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     tag: Tag,
     data: []const u8,
@@ -105,7 +105,7 @@ pub fn appendMessage(
     };
     // Guarantee capacity for header + payload in one check to avoid
     // intermediate realloc between the two appends on the hot path.
-    try list.ensureTotalCapacity(alloc, list.items.len + @sizeOf(Header) + data.len);
+    try list.ensureTotalCapacity(gpa, list.items.len + @sizeOf(Header) + data.len);
     list.appendSliceAssumeCapacity(std.mem.asBytes(&header));
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
@@ -115,7 +115,7 @@ pub fn appendMessage(
 fn writeAll(fd: i32, data: []const u8) !void {
     var index: usize = 0;
     while (index < data.len) {
-        const n = try posix.write(fd, data[index..]);
+        const n = try lib_posix.write(fd, data[index..]);
         if (n == 0) return error.DiskQuota;
         index += n;
     }
@@ -171,7 +171,7 @@ pub const SocketBuffer = struct {
         }
 
         var tmp: [4096]u8 = undefined;
-        const n = try posix.read(fd, &tmp);
+        const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
         }
@@ -223,7 +223,7 @@ const SessionProbeResult = struct {
 
     pub fn deinit(self: *const SessionProbeResult) void {
         if (self.labels) |lbl| self.alloc.free(lbl);
-        posix.close(self.fd);
+        lib_posix.close(self.fd);
     }
 };
 
@@ -233,13 +233,13 @@ pub fn probeSession(
 ) SessionProbeError!SessionProbeResult {
     const timeout_ms = 1000;
     const fd = try connectSession(socket_path);
-    errdefer posix.close(fd);
+    errdefer lib_posix.close(fd);
 
     send(fd, .Info, "") catch return error.Unexpected;
     send(fd, .LabelGet, "") catch {};
 
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) {
         return error.Timeout;
     }
@@ -269,7 +269,7 @@ pub fn probeSession(
         }
 
         // No complete message available, wait for more data
-        const more = posix.poll(&poll_fds, 50) catch break;
+        const more = lib_posix.poll(&poll_fds, 50) catch break;
         if (more == 0) break;
         const n_read = sb.read(fd) catch break;
         if (n_read == 0) break;
@@ -320,12 +320,12 @@ pub fn roundTripForTag(
 ) SessionProbeError![]u8 {
     const timeout_ms = 1000;
     const fd = try connectSession(socket_path);
-    defer posix.close(fd);
+    defer lib_posix.close(fd);
 
     send(fd, request_tag, payload) catch return error.Unexpected;
 
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) return error.Timeout;
 
     var sb = SocketBuffer.init(alloc) catch return error.Unexpected;

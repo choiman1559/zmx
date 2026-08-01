@@ -1,50 +1,60 @@
 const std = @import("std");
-const posix = std.posix;
+
+pub var log_system = LogSystem{};
+
+pub fn zmxLogFn(
+    comptime level: std.log.Level,
+    comptime scope: anytype,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    log_system.log(level, scope, format, args) catch {};
+}
 
 pub const LogSystem = struct {
-    file: ?std.fs.File = null,
-    mutex: std.Thread.Mutex = .{},
+    file: ?std.Io.File = null,
+    mutex: std.Io.Mutex = .init,
     current_size: u64 = 0,
-    max_size: u64 = 5 * 1024 * 1024, // 5MB
+    max_size: u64 = 2 * 1024 * 1024, // 2MB
     path: []const u8 = "",
-    alloc: std.mem.Allocator = undefined,
-    mode: u32 = 0o640,
+    io: std.Io = undefined,
+    mode: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(0o640),
 
-    pub fn init(self: *LogSystem, alloc: std.mem.Allocator, path: []const u8, mode: u32) !void {
-        self.alloc = alloc;
-        self.path = try alloc.dupe(u8, path);
+    pub fn init(self: *LogSystem, io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
+        self.io = io;
+        self.path = path;
         self.mode = mode;
 
-        const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => try std.fs.createFileAbsolute(
+        const file = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => try std.Io.Dir.createFileAbsolute(
+                self.io,
                 path,
-                .{ .read = true, .mode = @intCast(self.mode) },
+                .{ .read = true, .permissions = self.mode },
             ),
             else => return err,
         };
 
-        // fstat (not getEndPos) to avoid the statx syscall; see #186.
-        const st = try posix.fstat(file.handle);
-        const end_pos: u64 = @intCast(st.size);
-        try file.seekTo(end_pos);
+        const end_pos = try std.Io.File.length(file, self.io);
+        var buf: [1]u8 = undefined;
+        var w = std.Io.File.writer(file, self.io, &buf);
+        try w.seekTo(end_pos);
         self.current_size = end_pos;
         self.file = file;
     }
 
     pub fn deinit(self: *LogSystem) void {
-        if (self.file) |f| f.close();
-        if (self.path.len > 0) self.alloc.free(self.path);
+        if (self.file) |f| std.Io.File.close(f, self.io);
     }
 
     pub fn log(
         self: *LogSystem,
         comptime level: std.log.Level,
-        comptime scope: @Type(.enum_literal),
+        comptime scope: anytype,
         comptime format: []const u8,
         args: anytype,
-    ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    ) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.file == null) {
             std.log.defaultLog(level, scope, format, args);
@@ -52,12 +62,12 @@ pub const LogSystem = struct {
         }
 
         if (self.current_size >= self.max_size) {
-            self.rotate() catch |err| {
-                std.debug.print("Log rotation failed: {s}\n", .{@errorName(err)});
+            self.wipe() catch |err| {
+                std.debug.print("Log wipe failed: {s}\n", .{@errorName(err)});
             };
         }
 
-        const now = std.time.milliTimestamp();
+        const now: std.Io.Timestamp = .now(self.io, .real);
         const prefix = "[{d}] [{s}] ({s}): ";
         const scope_name = @tagName(scope);
         const level_name = level.asText();
@@ -76,29 +86,26 @@ pub const LogSystem = struct {
             self.current_size += total_len;
 
             var buf: [4096]u8 = undefined;
-            var w = f.writerStreaming(&buf);
-            w.interface.print(prefix ++ format ++ "\n", prefix_args ++ args) catch {};
+            var w = f.writerStreaming(self.io, &buf);
+            std.Io.Writer.print(&w.interface, prefix ++ format ++ "\n", prefix_args ++ args) catch {};
             w.interface.flush() catch {};
         }
     }
 
-    fn rotate(self: *LogSystem) !void {
+    fn wipe(self: *LogSystem) !void {
         if (self.file) |f| {
-            f.close();
+            std.Io.File.close(f, self.io);
             self.file = null;
         }
 
-        const old_path = try std.fmt.allocPrint(self.alloc, "{s}.old", .{self.path});
-        defer self.alloc.free(old_path);
-
-        std.fs.renameAbsolute(self.path, old_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-
-        self.file = try std.fs.createFileAbsolute(
+        self.file = try std.Io.Dir.createFileAbsolute(
+            self.io,
             self.path,
-            .{ .truncate = true, .read = true, .mode = @intCast(self.mode) },
+            .{
+                .truncate = true,
+                .read = true,
+                .permissions = self.mode,
+            },
         );
         self.current_size = 0;
     }

@@ -1123,7 +1123,7 @@ const Daemon = struct {
                 .ws_xpixel = resize.xpixel,
                 .ws_ypixel = resize.ypixel,
             };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+            _ = cross.c.ioctl(pty_fd, @bitCast(cross.c.TIOCSWINSZ), &ws);
             // Disable prompt_redraw before resize. The daemon's internal terminal
             // would otherwise clear prompt lines expecting the shell to redraw them,
             // but the shell's redraw goes to the PTY (forwarded to clients), not to
@@ -1166,7 +1166,7 @@ const Daemon = struct {
             .ws_xpixel = resize.xpixel,
             .ws_ypixel = resize.ypixel,
         };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        _ = cross.c.ioctl(pty_fd, @bitCast(cross.c.TIOCSWINSZ), &ws);
         // Disable prompt_redraw before resize (same rationale as handleInit).
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;

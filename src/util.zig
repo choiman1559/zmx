@@ -98,7 +98,7 @@ pub fn get_session_entries(
             try sessions.append(alloc, .{
                 .name = name,
                 .pid = result.info.pid,
-                .clients_len = result.info.clients_len,
+                .clients_len = @intCast(result.info.clients_len),
                 .is_error = false,
                 .error_name = null,
                 .cmd = cmd,

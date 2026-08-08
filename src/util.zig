@@ -2,7 +2,9 @@ const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
+const cross = @import("cross.zig");
 const label = @import("label.zig");
+const lib_posix = @import("posix.zig");
 const testing = std.testing;
 
 pub const SessionEntry = struct {
@@ -35,7 +37,6 @@ pub fn get_session_entries(
     io: std.Io,
     socket_dir: []const u8,
 ) !std.ArrayList(SessionEntry) {
-    std.log.info("get session entries socket_dir={s}", .{socket_dir});
     var dir = try std.Io.Dir.openDirAbsolute(io, socket_dir, .{ .iterate = true });
     defer dir.close(io);
     var iter = dir.iterate();
@@ -112,6 +113,18 @@ pub fn get_session_entries(
     }
 
     return sessions;
+}
+
+/// getCwd get the current working directory in a std.Uri format.
+/// Caller is responsible for releasing memory.
+pub fn getCwd(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const cur_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cur_path);
+
+    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname = try std.posix.gethostname(&buf);
+
+    return std.fmt.allocPrint(gpa, "file://{s}{s}", .{ hostname, cur_path });
 }
 
 pub fn shellNeedsQuoting(arg: []const u8) bool {
@@ -456,6 +469,13 @@ fn modifyOtherMatches(buf: []const u8, expected_key: u32, expected_mods: u32) bo
     return pos < buf.len and buf[pos] == '~';
 }
 
+/// Returns true when the user has opted out of the ctrl+\ detach shortcut
+/// via ZMX_NO_DETACH_KEY, e.g. to free up ctrl+\ for an inner program
+/// like vim, which uses ctrl+\ ctrl+n to escape its own terminal mode.
+pub fn isDetachKeyDisabled() bool {
+    return lib_posix.getenv("ZMX_NO_DETACH_KEY") != null;
+}
+
 /// Detects vt100 or kitty keyboard protocol escape sequence for up arrow.
 pub fn isUpArrow(buf: []const u8) bool {
     return std.mem.eql(u8, buf, "\x1b[A") or std.mem.eql(u8, buf, "\x1b[1;1:1A");
@@ -702,6 +722,16 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         return null;
     };
 
+    // The formatter has no title extra and never emits OSC 0/1/2, so the title
+    // has to be replayed separately or an attaching client shows whatever its
+    // terminal defaults to, usually the client process name. OSC 2 does not
+    // move the cursor, so this is safe to append after the content.
+    if (term.getTitle()) |title| {
+        builder.writer.print("\x1b]2;{s}\x07", .{title}) catch |err| {
+            std.log.warn("failed to format title err={s}", .{@errorName(err)});
+        };
+    }
+
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
 
@@ -810,7 +840,7 @@ pub fn writeSessionLine(
         session.created_at,
     });
     if (session.cwd) |cwd| {
-        try writer.print("\tstart_dir={s}", .{cwd});
+        try writer.print("\tcwd={s}", .{cwd});
     }
     if (session.cmd) |cmd| {
         try writer.print("\tcmd={s}", .{cmd});
@@ -1162,6 +1192,15 @@ test "isCtrlBackslash xterm modifyOtherKeys" {
     try expect(!isCtrlBackslash("\x1b[27;5;92"));
 }
 
+test "isDetachKeyDisabled" {
+    _ = cross.c.unsetenv("ZMX_NO_DETACH_KEY");
+    try testing.expect(!isDetachKeyDisabled());
+
+    _ = cross.c.setenv("ZMX_NO_DETACH_KEY", "1", 1);
+    defer _ = cross.c.unsetenv("ZMX_NO_DETACH_KEY");
+    try testing.expect(isDetachKeyDisabled());
+}
+
 test "serializeTerminalState excludes synchronized output replay" {
     const alloc = testing.allocator;
     const io = testing.io;
@@ -1191,11 +1230,54 @@ test "serializeTerminalState excludes synchronized output replay" {
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") == null);
 }
 
+test "serializeTerminalState replays the title" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b]2;my title\x07");
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;my title\x07") != null);
+}
+
+test "serializeTerminalState omits the title when none is set" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;") == null);
+}
+
 fn testCreateTerminal(alloc: std.mem.Allocator, io: std.Io, cols: u16, rows: u16, vt_data: []const u8) !ghostty_vt.Terminal {
     var term = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = cols,
         .rows = rows,
-        .max_scrollback = 10_000_000,
+        .max_scrollback_lines = 2_000,
     });
     if (vt_data.len > 0) {
         var stream = term.vtStream();
@@ -1227,7 +1309,7 @@ fn serializeRoundtrip(alloc: std.mem.Allocator, io: std.Io, source: *ghostty_vt.
     var dest = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = source.screens.active.pages.cols,
         .rows = source.screens.active.pages.rows,
-        .max_scrollback = 10_000_000,
+        .max_scrollback_lines = 2_000,
     });
     var stream = dest.vtStream();
     defer stream.deinit();

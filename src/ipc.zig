@@ -23,6 +23,9 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
+    EnvGet = 19,
+    EnvSet = 20,
+    EnvData = 21,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -45,6 +48,10 @@ pub const Resize = packed struct {
     cols: u16,
     xpixel: u16 = 0,
     ypixel: u16 = 0,
+
+    pub fn winsize(self: Resize) cross.c.struct_winsize {
+        return .{ .ws_row = self.rows, .ws_col = self.cols, .ws_xpixel = self.xpixel, .ws_ypixel = self.ypixel };
+    }
 };
 
 pub fn getTerminalSize(fd: i32) Resize {
@@ -123,6 +130,23 @@ pub fn appendMessage(
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
     }
+}
+
+/// Pre-0.7.0 daemons expect a 4-byte Init/Resize payload (rows+cols, no
+/// pixel size) and silently drop the 8-byte form, hanging `zmx attach`
+/// against a running old daemon (#211). Append both encodings: every daemon
+/// drops the length it doesn't expect and processes the other exactly once.
+pub const LEGACY_RESIZE_LEN = 4;
+
+pub fn appendSizeMessage(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    tag: Tag,
+    size: Resize,
+) !void {
+    const bytes = std.mem.asBytes(&size);
+    try appendMessage(alloc, list, tag, bytes);
+    try appendMessage(alloc, list, tag, bytes[0..LEGACY_RESIZE_LEN]);
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
@@ -353,6 +377,30 @@ pub fn roundTripForTag(
         }
     }
     return error.Unexpected;
+}
+
+test "appendSizeMessage emits current and legacy encodings" {
+    const alloc = std.testing.allocator;
+    var list = try std.ArrayList(u8).initCapacity(alloc, 64);
+    defer list.deinit(alloc);
+
+    const size = Resize{ .rows = 45, .cols = 170, .xpixel = 900, .ypixel = 1800 };
+    try appendSizeMessage(alloc, &list, .Init, size);
+
+    const h1 = std.mem.bytesToValue(Header, list.items[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.Init, h1.tag);
+    try std.testing.expectEqual(@as(u32, @sizeOf(Resize)), h1.len);
+    const p1 = list.items[@sizeOf(Header)..][0..@sizeOf(Resize)];
+    try std.testing.expectEqual(size, std.mem.bytesToValue(Resize, p1));
+
+    const off2 = @sizeOf(Header) + @sizeOf(Resize);
+    const h2 = std.mem.bytesToValue(Header, list.items[off2..][0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.Init, h2.tag);
+    try std.testing.expectEqual(@as(u32, LEGACY_RESIZE_LEN), h2.len);
+    // Legacy payload is the rows+cols prefix of the current encoding.
+    const p2 = list.items[off2 + @sizeOf(Header) ..][0..LEGACY_RESIZE_LEN];
+    try std.testing.expectEqualSlices(u8, p1[0..LEGACY_RESIZE_LEN], p2);
+    try std.testing.expectEqual(off2 + @sizeOf(Header) + LEGACY_RESIZE_LEN, list.items.len);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

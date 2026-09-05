@@ -998,7 +998,7 @@ pub const Daemon = struct {
         // only resize if leader
         if (is_leader) {
             var ws = resize.winsize();
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+            _ = cross.c.ioctl(pty_fd, @bitCast(cross.c.TIOCSWINSZ), &ws);
 
             // On re-attach, deliver SIGWINCH to the foreground process group so
             // incremental renderers (Ink, Claude Code, etc.) know to repaint.
@@ -1035,7 +1035,7 @@ pub const Daemon = struct {
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
         var ws = resize.winsize();
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        _ = cross.c.ioctl(pty_fd, @bitCast(cross.c.TIOCSWINSZ), &ws);
         try resizeTerm(gpa, term, resize.cols, resize.rows);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
